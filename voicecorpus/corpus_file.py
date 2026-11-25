@@ -43,6 +43,10 @@ def write(path, K, name='Villager'):
 
 import os
 STILL, LOOP, SLACK = 3.0, 6, 1.5  # sustain hold (see CorpusVoice.kt)
+STILL_SPAN = int(os.environ.get('STILL_SPAN', 10))   # frames the input must stay still (100 ms)
+NO_REPLAY = int(os.environ.get('NO_REPLAY', 30))    # jumps may not land in audio played in the last N frames (±2)
+MIN_RUN = int(os.environ.get('MIN_RUN', 1))         # frames to keep playing after a jump
+GRAIN_HOPS = int(os.environ.get('GRAIN_HOPS', 2))   # grain length in hops (Hann, overlap-add sum = GRAIN_HOPS/2)
 LEVEL_TARGET, MAX_BOOST, MIN_GAIN = 0.1, 8.0, 0.5
 LEVEL_RATE, GAIN_RATE = 1 - np.exp(-0.01 / 0.5), 1 - np.exp(-0.01 / 0.3)
 def synth(x, K, ratio=2.0, tol=80, stats=None, hold=True, level=True):
@@ -51,10 +55,10 @@ def synth(x, K, ratio=2.0, tol=80, stats=None, hold=True, level=True):
     F = U.features_any(L, c, lev, hz, conf, K['cmean0'].astype(np.float64).copy(), np.log2(120.0))
     pw = power_level(L)
     Z = (F - K['mu']) * K['w']
-    n = len(F); Y = K['Y']; G = 2 * H; han = np.hanning(G + 1)[:G]
+    n = len(F); Y = K['Y']; G = GRAIN_HOPS * H; han = (0.5 - 0.5 * np.cos(2 * np.pi * np.arange(G) / G)) * (2.0 / GRAIN_HOPS)
     pos = -np.ones(len(K['LY']), int); pos[K['cand']] = np.arange(len(K['cand']))
     out = np.zeros(len(x) + 2 * G); prev = -1; pstart = 0; g = 0.0; runs = []; run = 0
-    hist = []; anchor = np.inf; holds = 0; active = np.zeros(n, bool)
+    hist = []; anchor = np.inf; holds = 0; active = np.zeros(n, bool); played = []; since_jump = 0
     def dist(f, e):
         k = pos[f] if 0 <= f < len(pos) else -1
         return np.inf if k < 0 else float(((K['E'][k] - e) ** 2).sum())
@@ -68,21 +72,29 @@ def synth(x, K, ratio=2.0, tol=80, stats=None, hold=True, level=True):
         e = (q - K['mean']) @ K['P']
         dc = ((K['cent'] - e) ** 2).sum(1)
         best, j = np.inf, -1
+        banned = played[-NO_REPLAY:] if NO_REPLAY else []
         for k in np.argsort(dc, kind='stable')[:PROBES]:
             a, b = K['starts'][k], K['starts'][k + 1]
             if a == b: continue
-            d = ((K['E'][a:b] - e) ** 2).sum(1); m = int(np.argmin(d))
+            d = ((K['E'][a:b] - e) ** 2).sum(1)
+            if banned:
+                cf = K['cand'][a:b]
+                for p_ in banned: d = np.where(np.abs(cf - p_) <= 2, np.inf, d)
+            m = int(np.argmin(d))
             if d[m] < best: best, j = d[m], int(K['cand'][a + m])
-        hist = (hist + [e])[-4:]
-        still = hold and len(hist) == 4 and float(((hist[-1] - hist[0]) ** 2).sum()) < STILL
+        if j < 0: prev = -1; continue
+        hist = (hist + [e])[-(STILL_SPAN + 1):]
+        still = (hold and len(hist) == STILL_SPAN + 1 and conf[t] > .5
+                 and max(float(((hist[-1] - h) ** 2).sum()) for h in hist[:-1]) < STILL)
         if not still: anchor = np.inf
-        cont = prev >= 0 and pos[prev + 1] >= 0 and ((K['E'][pos[prev + 1]] - e) ** 2).sum() <= ratio * best
+        cont = prev >= 0 and pos[prev + 1] >= 0 and (since_jump < MIN_RUN or ((K['E'][pos[prev + 1]] - e) ** 2).sum() <= ratio * best)
         if still and prev >= 0:
             dn = dist(prev + 1, e); anchor = min(anchor, dist(prev, e))
             if dn > SLACK * anchor and best > 0.3 * anchor:
                 back = [(dist(f, e), f) for f in range(prev - LOOP, prev) if dist(f, e) < np.inf]
                 if back:
                     cont = False; j = min(back)[1]; holds += 1
+        since_jump = since_jump + 1 if cont else 0
         if cont:
             j = prev + 1; start = pstart + H; run += 1
         else:
@@ -101,6 +113,14 @@ def synth(x, K, ratio=2.0, tol=80, stats=None, hold=True, level=True):
         target = 10 ** ((pw[t] - K['LY'][j]) / 20)
         g = target if prev < 0 else g + 0.5 * (target - g)
         out[t * H:t * H + G] += Y[start:start + G] * han * g
+        if stats is not None:
+            recent = stats.setdefault('_recent', [])
+            if not cont and j in recent[-30:]: stats['replays'] = stats.get('replays', 0) + 1
+            if not cont: stats['jumps'] = stats.get('jumps', 0) + 1
+            if still: stats['still_frames'] = stats.get('still_frames', 0) + 1
+            stats['active_frames'] = stats.get('active_frames', 0) + 1
+            recent.append(j); del recent[:-60]
+        played.append(j); del played[:-max(NO_REPLAY, 1)]
         prev = j; pstart = start
     if run: runs.append(run)
     if level:  # output leveler (CorpusVoice.Engine.level): hop t is complete after frame t
