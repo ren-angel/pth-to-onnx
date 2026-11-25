@@ -1,0 +1,4 @@
+phone-files/
+__pycache__/
+.venv/
+*.pyc
