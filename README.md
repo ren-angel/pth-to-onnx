@@ -85,7 +85,7 @@ Only use voices you have the right to use: your own, voices whose owner agreed, 
 
 1. **Export** — loads the checkpoint with PyTorch (`weights_only`), rebuilds the RVC synthesizer with the [w-okada voice-changer](https://github.com/w-okada/voice-changer) inference classes (fetched at a pinned commit), exports ONNX opset 17 with the metadata the app validates (`samplingRate`, `f0`, `embChannels`, `embOutputLayer`, `useFinalProj`) and checks it runs in ONNX Runtime.
 2. **Encoder** — ContentVec ONNX (`units9` for v1, `unit12` for v2), plus a dynamic INT8 copy for phones.
-3. **Live voice** — runs the model over `data/source_speech.src` (5 min: sentences and sustained vowels from 24 speakers, pitch moved to `--hz`), then `voicecorpus/` measures the source speech per 10 ms frame (spectral shape, loudness, voicing, relative pitch), reduces it with PCA and indexes it with k-means. The app plays back the model's audio for the frames that best match your speech. File format: `VCP2`.
+3. **Live voice** — runs the model over `data/source_speech.src` (5 min: sentences and sustained vowels from 24 speakers, pitch moved to `--hz`), then `voicecorpus/` measures the source speech per 10 ms frame (phonetic content, loudness, voicing, relative pitch), reduces it with PCA and indexes it with k-means. The app plays back the model's audio for the frames that best match your speech. Matching uses a small phonetic network distilled from ContentVec (`data/content_model.bin`, embedded in every `.vcp`), so the voice follows what you say. File format: `VCP3`.
 
 `voicecorpus/` must stay in step with the app's `CorpusVoice`/`SourceAnalyzer`; a `.vcp` built by a mismatched version is rejected by the app.
 

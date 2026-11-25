@@ -59,4 +59,26 @@ BW = (EDGES[2:] - EDGES[:-2]) / 2
 def power_level(L):
     """Bandwidth-weighted power in dB (loudness for gain matching)."""
     return 10 * np.log10((10 ** (L / 10) * BW).sum(1) + 1e-10)
-WEIGHTS = np.array([1.0] * NC + [0.5] * 8 + [1.2, 1.2, 2.5])
+WEIGHTS_CEP = np.array([1.0] * NC + [0.5] * 8 + [1.2, 1.2, 2.5])
+WEIGHTS = WEIGHTS_CEP
+
+# Feature set: 'cep' = normalised cepstra + deltas (VCP2); 'phon' = phonetic student embedding (VCP3).
+MODE = 'cep'
+STUDENT = None
+PITCH_WEIGHT = 1.5
+
+def use_student(model):
+    """model: dict(W=[(w, b)...], M0=...) from train_student.py; switches features to the phonetic set."""
+    global MODE, STUDENT, WEIGHTS
+    MODE, STUDENT = 'phon', model
+    WEIGHTS = np.array([1.0] * 32 + [1.2, 1.2, PITCH_WEIGHT])
+
+def dim(): return NC + 8 + 3 if MODE == 'cep' else 35
+def rel_index(): return NC + 8 if MODE == 'cep' else 32
+
+def features_any(L, c, lev, hz, conf, cmean0, pmed0):
+    F = features(c, lev, hz, conf, cmean0, pmed0)
+    if MODE == 'cep': return F
+    from student import frame_inputs, context, mlp
+    E = mlp(context(frame_inputs(L, conf, STUDENT['M0']), STUDENT.get('taps')), STUDENT['W'])
+    return np.concatenate([E, F[:, NC + 8:NC + 11]], 1)

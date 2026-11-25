@@ -3,16 +3,16 @@ import sys, os, struct, numpy as np
 sys.path.insert(0, os.path.dirname(__file__)); from units import *
 from units_synth import build as build_raw, LAGS, LAGW
 PCA_DIM, CLUSTERS, PROBES = 24, 256, 8
-D = NC + 8 + 3
+import units as U
 
 def compile_corpus(files, seed=0, max_minutes=None):
     C = build_raw(files)
-    w = WEIGHTS / C['sd']
+    w = U.WEIGHTS / C['sd']
     Z = (C['F'] - C['mu']) * w
     S = np.concatenate([np.concatenate([np.repeat(Z[:1], l, 0), Z[:len(Z) - l]]) * g if l else Z * g for l, g in zip(LAGS, LAGW)], 1)
     cand = np.flatnonzero(C['valid'])
     X = S[cand]; mean = X.mean(0)
-    U, s, Vt = np.linalg.svd(X - mean, full_matrices=False)
+    _u, s, Vt = np.linalg.svd(X - mean, full_matrices=False)
     P = Vt[:PCA_DIM].T.astype(np.float32)                       # (3D x PCA_DIM)
     E = ((X - mean) @ P).astype(np.float32)
     rng = np.random.default_rng(seed)
@@ -31,30 +31,36 @@ def compile_corpus(files, seed=0, max_minutes=None):
 def write(path, K, name='Villager'):
     with open(path, 'wb') as f:
         nm = name.encode('utf-8')
-        f.write(b'VCP2'); f.write(struct.pack('<6i', FS, H, len(K['LY']), len(K['Y']), len(K['cand']), CLUSTERS))
-        f.write(struct.pack('<3i', D, len(LAGS) * D, PCA_DIM)); f.write(struct.pack('<i', len(nm))); f.write(nm + b'\0' * (-len(nm) % 4))
+        f.write(b'VCP3' if U.MODE == 'phon' else b'VCP2'); f.write(struct.pack('<6i', FS, H, len(K['LY']), len(K['Y']), len(K['cand']), CLUSTERS))
+        f.write(struct.pack('<3i', U.dim(), len(LAGS) * U.dim(), PCA_DIM)); f.write(struct.pack('<i', len(nm))); f.write(nm + b'\0' * (-len(nm) % 4))
         for a in ('mu', 'w', 'cmean0', 'mean', 'P', 'cent', 'E', 'LY'):
             f.write(np.ascontiguousarray(K[a], '<f4').tobytes())
         f.write(np.ascontiguousarray(K['cand'], '<i4').tobytes()); f.write(np.ascontiguousarray(K['starts'], '<i4').tobytes())
+        if U.MODE == 'phon':  # VCP3: the phonetic feature model travels with the corpus
+            from student import to_bytes
+            blk = to_bytes(U.STUDENT); f.write(struct.pack('<i', len(blk))); f.write(blk + b'\0' * (-len(blk) % 4))
         f.write((np.clip(K['Y'], -1, 1) * 32767).astype('<i2').tobytes())
 
 import os
 STILL, LOOP, SLACK = 3.0, 6, 1.5  # sustain hold (see CorpusVoice.kt)
-def synth(x, K, ratio=10.0, tol=80, stats=None, hold=True):
+LEVEL_TARGET, MAX_BOOST, MIN_GAIN = 0.1, 8.0, 0.5
+LEVEL_RATE, GAIN_RATE = 1 - np.exp(-0.01 / 0.5), 1 - np.exp(-0.01 / 0.3)
+def synth(x, K, ratio=2.0, tol=80, stats=None, hold=True, level=True):
     """Offline twin of CorpusVoice (gate off). x: 16 kHz float."""
     L, c, lev, hz, conf = raw_frames(x)
-    F = features(c, lev, hz, conf, K['cmean0'].astype(np.float64).copy(), np.log2(120.0))
+    F = U.features_any(L, c, lev, hz, conf, K['cmean0'].astype(np.float64).copy(), np.log2(120.0))
     pw = power_level(L)
     Z = (F - K['mu']) * K['w']
     n = len(F); Y = K['Y']; G = 2 * H; han = np.hanning(G + 1)[:G]
     pos = -np.ones(len(K['LY']), int); pos[K['cand']] = np.arange(len(K['cand']))
     out = np.zeros(len(x) + 2 * G); prev = -1; pstart = 0; g = 0.0; runs = []; run = 0
-    hist = []; anchor = np.inf; holds = 0
+    hist = []; anchor = np.inf; holds = 0; active = np.zeros(n, bool)
     def dist(f, e):
         k = pos[f] if 0 <= f < len(pos) else -1
         return np.inf if k < 0 else float(((K['E'][k] - e) ** 2).sum())
     for t in range(n):
-        if F[t, NC + 8] <= -1.5:
+        active[t] = F[t, U.rel_index()] > -1.5
+        if not active[t]:
             prev = -1
             if run: runs.append(run); run = 0
             continue
@@ -97,11 +103,18 @@ def synth(x, K, ratio=10.0, tol=80, stats=None, hold=True):
         out[t * H:t * H + G] += Y[start:start + G] * han * g
         prev = j; pstart = start
     if run: runs.append(run)
+    if level:  # output leveler (CorpusVoice.Engine.level): hop t is complete after frame t
+        pw, g = LEVEL_TARGET ** 2, 1.0
+        for t in range(n):
+            seg = out[t * H:(t + 1) * H]; p = float(np.mean(seg.astype(np.float32) ** 2))
+            if active[t] and p > 1e-6: pw += LEVEL_RATE * (p - pw)
+            g += GAIN_RATE * (min(max(LEVEL_TARGET / np.sqrt(pw), MIN_GAIN), MAX_BOOST) - g)
+            out[t * H:(t + 1) * H] = seg * g
     if stats is not None: stats['mean_run'] = float(np.mean(runs)) if runs else 0.0; stats['holds'] = holds
     return out[H:H + len(x)]
 
 def read(path):
-    b = open(path, 'rb').read(); assert b[:4] == b'VCP2'
+    b = open(path, 'rb').read(); assert b[:4] in (b'VCP2', b'VCP3')
     fs, h, nf, ns, nc, cl, d, d3, pd, nl = struct.unpack_from('<10i', b, 4); o = 44 + nl + (-nl % 4)
     K = dict(name=b[44:44 + nl].decode())
     for k, n in (('mu', d), ('w', d), ('cmean0', NC), ('mean', d3), ('P', d3 * pd), ('cent', cl * pd), ('E', nc * pd), ('LY', nf)):
@@ -109,5 +122,11 @@ def read(path):
     K['P'] = K['P'].reshape(d3, pd); K['cent'] = K['cent'].reshape(cl, pd); K['E'] = K['E'].reshape(nc, pd)
     K['cand'] = np.frombuffer(b, '<i4', nc, o).astype(int); o += 4 * nc
     K['starts'] = np.frombuffer(b, '<i4', cl + 1, o).astype(int); o += 4 * (cl + 1)
+    if b[:4] == b'VCP3':
+        from student import from_bytes
+        ln = struct.unpack_from('<i', b, o)[0]; o += 4; K['student'] = from_bytes(b[o:o + ln]); o += ln + (-ln % 4)
+        U.use_student(K['student'])
+    else:
+        U.MODE, U.WEIGHTS = 'cep', U.WEIGHTS_CEP
     K['Y'] = np.frombuffer(b, '<i2', ns, o) / 32767.0; o += 2 * ns
     assert o == len(b); return K

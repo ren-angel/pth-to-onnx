@@ -49,6 +49,10 @@ def build_vcp(encoder, synth, name, out, hz=110.0, source=os.path.join(os.path.d
         # compile_corpus expects 40 kHz targets (it resamples by 2/5 to 16 kHz).
         path = os.path.join(work, f'train_{spk}_{i}.npz'); np.savez(path, x=x, y=resample_poly(y, 5, 2), f0=p, med=med); files.append(path)
         log(f'  reference speech {i + 1}/{n}')
+    # VCP3: match on the bundled phonetic content model (also embedded in the .vcp for the app).
+    import units as U
+    from student import from_bytes
+    U.use_student(from_bytes(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'content_model.bin'), 'rb').read()))
     K = compile_corpus(files); write(out, K, name)
     return os.path.getsize(out)
 
